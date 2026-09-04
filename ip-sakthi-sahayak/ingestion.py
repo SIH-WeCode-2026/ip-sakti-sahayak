@@ -53,13 +53,7 @@ hybrid_retrieval.connect("text_embedder", "embedding_retriever")
 hybrid_retrieval.connect("bm25_retriever", "ranker")
 hybrid_retrieval.connect("embedding_retriever", "ranker")
 
-query = "apnea in infants"
-
 result = hybrid_retrieval.run(
     {"text_embedder": {"text": query}, "bm25_retriever": {"query": query}, "ranker": {"query": query}}
 )
 
-for doc in result["ranker"]["documents"]:
-    print(doc.meta["title"], "\t", doc.score)
-    print(doc.meta["abstract"])
-    print("\n")
