@@ -25,7 +25,7 @@ document_embedder = SentenceTransformersDocumentEmbedder(
 document_writer = DocumentWriter(document_store)
 
 text_embedder = SentenceTransformersTextEmbedder(
-    model="BAAI/bge-small-en-v1.5", device=ComponentDevice.from_str("cpu")
+    model="sentence-transformers/all-MiniLM-L6-v2", device=ComponentDevice.from_str("cpu")
 )
 embedding_retriever = InMemoryEmbeddingRetriever(document_store)
 bm25_retriever = InMemoryBM25Retriever(document_store)
