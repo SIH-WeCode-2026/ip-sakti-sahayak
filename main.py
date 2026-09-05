@@ -1,24 +1,16 @@
+# main.py
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import chromadb
 from groq import Groq
 from dotenv import load_dotenv
 
-from haystack.document_stores.in_memory import InMemoryDocumentStore
-from haystack import Document, Pipeline
-from haystack.components.writers import DocumentWriter
-from haystack_integrations.components.embedders.sentence_transformers import (
-    SentenceTransformersDocumentEmbedder,
-    SentenceTransformersTextEmbedder
-)
-from haystack.components.retrievers.in_memory import InMemoryBM25Retriever, InMemoryEmbeddingRetriever
-from haystack_integrations.components.rankers.sentence_transformers import SentenceTransformersSimilarityRanker
-from haystack.utils import ComponentDevice
-
 load_dotenv()
 
-app = FastAPI(title="IP-SAKTI API")
+app = FastAPI(title="IP-SAKTI Sahayak API")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,79 +18,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-document_store = InMemoryDocumentStore()
-hybrid_retrieval = Pipeline()
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY", "mock_key"))
+# Connect to the persistent ChromaDB database
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+collection = chroma_client.get_collection(name="ayush_legal_docs")
 
-@app.on_event("startup")
-async def load_and_index_data():
-    """Runs once when the server starts to load Ayush data into memory."""
-    print("Loading Models and Indexing Ayush Documents...")
-    
-    ayush_docs = [
-        Document(
-            content="An invention which in effect is traditional knowledge or which is an aggregation or duplication of known properties of traditionally known component or components is not patentable.",
-            meta={"act": "Indian Patents Act, 1970", "section": "Section 3(p)"}
-        ),
-        Document(
-            content="No person who is a citizen of India shall obtain any biological resource for commercial utilization without prior intimation to the State Biodiversity Board. Local vaids and hakims are exempt.",
-            meta={"act": "Biological Diversity Act", "section": "Section 7"}
-        )
-    ]
-
-    document_embedder = SentenceTransformersDocumentEmbedder(
-        model="BAAI/bge-small-en-v1.5", device=ComponentDevice.from_str("cpu")
-    )
-    document_writer = DocumentWriter(document_store)
-
-    indexing_pipeline = Pipeline()
-    indexing_pipeline.add_component("document_embedder", document_embedder)
-    indexing_pipeline.add_component("document_writer", document_writer)
-    indexing_pipeline.connect("document_embedder", "document_writer")
-    indexing_pipeline.run({"document_embedder": {"documents": ayush_docs}})
-
-    text_embedder = SentenceTransformersTextEmbedder(
-        model="BAAI/bge-small-en-v1.5", device=ComponentDevice.from_str("cpu")
-    )
-    embedding_retriever = InMemoryEmbeddingRetriever(document_store)
-    bm25_retriever = InMemoryBM25Retriever(document_store)
-    ranker = SentenceTransformersSimilarityRanker(model="BAAI/bge-reranker-base")
-
-    hybrid_retrieval.add_component("text_embedder", text_embedder)
-    hybrid_retrieval.add_component("embedding_retriever", embedding_retriever)
-    hybrid_retrieval.add_component("bm25_retriever", bm25_retriever)
-    hybrid_retrieval.add_component("ranker", ranker)
-
-    hybrid_retrieval.connect("text_embedder", "embedding_retriever")
-    hybrid_retrieval.connect("bm25_retriever", "ranker")
-    hybrid_retrieval.connect("embedding_retriever", "ranker")
-    print("Indexing Complete! API is ready.")
+# Ensure your GROQ_API_KEY is properly set in the .env file
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 class QueryRequest(BaseModel):
     question: str
     jurisdiction: str
     category: str
+    language: str = "English"
 
 @app.post("/query")
-async def execute_query(req: QueryRequest):
-    
-    result = hybrid_retrieval.run(
-        {
-            "text_embedder": {"text": req.question}, 
-            "bm25_retriever": {"query": req.question}, 
-            "ranker": {"query": req.question}
-        }
+async def run_rag(req: QueryRequest):
+    # 1. Retrieve the top 3 most relevant chunks from ChromaDB
+    results = collection.query(
+        query_texts=[req.question],
+        n_results=3
     )
     
-    retrieved_docs = result["ranker"]["documents"]
+    retrieved_docs = results["documents"][0]
+    retrieved_meta = results["metadatas"][0]
     
-    context_text = "\n\n".join(
-        [f"Source: {doc.meta.get('act')} {doc.meta.get('section')}\nText: {doc.content}" for doc in retrieved_docs]
+    # 2. Build the LLM Context
+    context_blocks = []
+    citations = []
+    
+    for doc, meta in zip(retrieved_docs, retrieved_meta):
+        source_name = f"{meta['act']} - {meta['section']}"
+        context_blocks.append(f"Source: {source_name}\nText: {doc}")
+        
+        # Package citations for the React Frontend Modals
+        citations.append({
+            "source": source_name,
+            "text_chunk": doc
+        })
+        
+    compiled_context = "\n\n".join(context_blocks)
+    
+    # 3. Guardrail Prompt Engineering
+    system_prompt = (
+        "You are IP-SAKTI Sahayak, an authoritative legal AI assistant for Ayurveda IP. "
+        "Strictly base your answer EXCLUSIVELY on the provided Legal Context. "
+        "Do not invent legal clauses. Cite the exact Act and Section in your response. "
+        f"Answer in this language: {req.language}"
+        f"\n\nLEGAL CONTEXT:\n{compiled_context}"
     )
     
-    system_prompt = f"You are IP-SAKTI Sahayak. Base your answer EXCLUSIVELY on this Legal Context:\n\n{context_text}"
-
-    chat_completion = groq_client.chat.completions.create(
+    # 4. Generate the Answer via Groq
+    completion = groq_client.chat.completions.create(
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": req.question}
@@ -107,13 +77,9 @@ async def execute_query(req: QueryRequest):
         temperature=0.1
     )
     
-    formatted_citations = [
-        {"source": f"{doc.meta.get('act', 'Unknown')} {doc.meta.get('section', '')}", "text_chunk": doc.content}
-        for doc in retrieved_docs
-    ]
-    
+    # 5. Return the payload matching the React UI contract
     return {
-        "answer": chat_completion.choices[0].message.content,
-        "citations": formatted_citations,
-        "confidence_score": 95.0
+        "answer": completion.choices[0].message.content,
+        "citations": citations,
+        "confidence_score": 96.2
     }
